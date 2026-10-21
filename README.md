@@ -35,6 +35,23 @@ else.
 Without RenderHook, or with its `UseIdleHook` off, the original `Idle` runs and the bridge
 does nothing.
 
+## Double get-up fix
+
+With Jolt Physics, a ped knocked down (falling off a bike, for example) gets up twice, the
+second time with a jolt. This happens with or without RenderHook:
+
+1. The knockdown gives the ped the game's own `TASK_COMPLEX_FALL_AND_GET_UP` (208) in an
+   event-response task slot.
+2. Jolt ragdolls the body. When it settles, Jolt adds its own `TASK_SIMPLE_GET_UP` (205) through
+   `CPedIntelligence::AddTaskPhysResponse` (`0x600DC0`). The physical-response slot has priority,
+   so Jolt's get-up plays first.
+3. When it ends, the game's fall task resumes in its lower slot and plays a second get-up.
+
+The bridge hooks Jolt's call to `AddTaskPhysResponse`. When Jolt adds a get-up, the bridge
+aborts and removes a waiting fall-and-get-up task from the event-response slots, so only Jolt's
+get-up plays. It only patches the Jolt build it was traced on (the September 22 build) and logs
+it if your build differs.
+
 ## Install
 
 1. Install Jolt Physics. Put `JoltPhysics.SA.asi`, `.ini` and `.dat` in the **game
@@ -44,6 +61,7 @@ does nothing.
 
    ```
    hooked Render2dStuff call at 0x0053EB12 (previous target 0x0053E230)
+   JoltPhysics.SA.asi at 0x...: double get-up fix installed
    repointed 2 RenderHook CGame::Process pointer(s) to the 0x53E981 chain head 0x...
    first renderSceneEvent fired via chain head 0x...
    ```

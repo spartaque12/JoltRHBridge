@@ -15,6 +15,13 @@
  * gameProcessEvent: RenderHook calls CGame::Process through function pointers it fills with
  * 0x53BEE0 at startup. We repoint those at a function that runs the 0x53E981 hook chain
  * instead, which calls CGame::Process once and then every gameProcessEvent subscriber.
+ *
+ * Double get-up fix (with or without RenderHook): a knockdown gives the ped the game's own
+ * TASK_COMPLEX_FALL_AND_GET_UP in an event-response task slot. Jolt ragdolls the body and then
+ * adds its own TASK_SIMPLE_GET_UP as the physical response, which has priority; when Jolt's
+ * get-up ends, the game's fall task resumes and the ped gets up a second time. We hook Jolt's
+ * call to CPedIntelligence::AddTaskPhysResponse and, when it adds a get-up, abort and remove
+ * the game's pending fall-and-get-up.
  */
 #include <windows.h>
 #include <intrin.h>
@@ -27,6 +34,19 @@
 #define ADDR_GAMEPROCESS      0x53BEE0 /* CGame::Process() */
 #define EXE_CODE_BEGIN        0x401000
 #define EXE_CODE_END          0x857000
+
+#define ADDR_ADD_TASK_PHYS_RESPONSE 0x600DC0 /* CPedIntelligence::AddTaskPhysResponse(CTask *, bool) */
+#define JOLT_PREFERRED_BASE   0x616C0000
+#define JOLT_ADDPHYS_CALL     (0x618913CE - JOLT_PREFERRED_BASE) /* mov eax, 0x600DC0 in Jolt's task helper */
+#define TASK_SIMPLE_GET_UP    205
+#define TASK_COMPLEX_FALL_AND_GET_UP 208
+#define ABORT_PRIORITY_IMMEDIATE 2
+
+/* __thiscall isn't available for plain C functions; __fastcall with an unused edx is the same call. */
+typedef void(__fastcall *AddTaskPhysResponse_t)(void *intelligence, void *edx, void *task, int unused);
+typedef int(__fastcall *TaskGetType_t)(void *task, void *edx);
+typedef BYTE(__fastcall *TaskMakeAbortable_t)(void *task, void *edx, void *ped, int priority, const void *event);
+typedef void *(__fastcall *TaskDelete_t)(void *task, void *edx, unsigned flags);
 
 typedef int(__cdecl *Render2dStuff_t)(void);
 typedef void(__cdecl *RenderScene_t)(void);
@@ -105,10 +125,54 @@ static void PatchRenderHookGameProcess(void)
         patched, CallTarget(ADDR_GAMEPROCESS_CALL));
 }
 
+/* CTask vtable: 0 deleting dtor, 4 GetTaskType, 6 MakeAbortable */
+static int TaskType(void *task)
+{
+    return ((TaskGetType_t)(*(void ***)task)[4])(task, 0);
+}
+
+static void __fastcall AddTaskPhysResponseHook(void *intelligence, void *edx, void *task, int unused)
+{
+    void *ped = *(void **)intelligence;                       /* CPedIntelligence::m_pPed */
+    void **slots = (void **)((BYTE *)intelligence + 4);        /* CTaskManager::m_aPrimaryTasks[5] */
+    int slot;
+
+    ((AddTaskPhysResponse_t)ADDR_ADD_TASK_PHYS_RESPONSE)(intelligence, edx, task, unused);
+    if (!task || TaskType(task) != TASK_SIMPLE_GET_UP) return;
+    for (slot = 1; slot <= 2; slot++) { /* TASK_PRIMARY_EVENT_RESPONSE_TEMP / _NONTEMP */
+        void *waiting = slots[slot];
+        if (!waiting || TaskType(waiting) != TASK_COMPLEX_FALL_AND_GET_UP) continue;
+        if (!((TaskMakeAbortable_t)(*(void ***)waiting)[6])(waiting, 0, ped, ABORT_PRIORITY_IMMEDIATE, 0)) continue;
+        slots[slot] = 0;
+        ((TaskDelete_t)(*(void ***)waiting)[0])(waiting, 0, 1);
+    }
+}
+
+/* Only for the JoltPhysics.SA.asi build this was traced on; any other build is left alone. */
+static void PatchJoltGetUp(void)
+{
+    BYTE *jolt = (BYTE *)GetModuleHandleA("JoltPhysics.SA.asi"), *at;
+    DWORD old;
+
+    if (!jolt) return;
+    at = jolt + JOLT_ADDPHYS_CALL;
+    if (at[0] != 0xB8 || *(DWORD *)(at + 1) != ADDR_ADD_TASK_PHYS_RESPONSE) {
+        Log("JoltPhysics.SA.asi at 0x%08X: unknown build, double get-up fix not installed", (DWORD)(UINT_PTR)jolt, 0);
+        return;
+    }
+    VirtualProtect(at + 1, 4, PAGE_EXECUTE_READWRITE, &old);
+    *(DWORD *)(at + 1) = (DWORD)(UINT_PTR)AddTaskPhysResponseHook;
+    VirtualProtect(at + 1, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), at, 5);
+    Log("JoltPhysics.SA.asi at 0x%08X: double get-up fix installed", (DWORD)(UINT_PTR)jolt, 0);
+}
+
 static int __cdecl Render2dStuffHook(void)
 {
-    static LONG rhPatched;
+    static LONG rhPatched, joltPatched;
     DWORD ret = (DWORD)(UINT_PTR)_ReturnAddress();
+    if (!InterlockedExchange(&joltPatched, 1))
+        PatchJoltGetUp(); /* every mod is loaded and hooked by now */
     /* From the original Idle the events already fired; only bridge RenderHook's Idle. */
     if (ret < EXE_CODE_BEGIN || ret >= EXE_CODE_END) {
         if (!InterlockedExchange(&rhPatched, 1))

@@ -22,6 +22,12 @@
  * get-up ends, the game's fall task resumes and the ped gets up a second time. We hook Jolt's
  * call to CPedIntelligence::AddTaskPhysResponse and, when it adds a get-up, abort and remove
  * the game's pending fall-and-get-up.
+ *
+ * VirtualQuery cache: before reading a game pointer, Jolt checks it is readable by calling
+ * VirtualQuery (a system call) on it - thousands of times a frame in busy scenes, which costs
+ * the main thread 5-35 ms in some frames. We redirect Jolt's VirtualQuery import: on the main
+ * thread, an answer is reused for any address in the same memory region until the frame ends;
+ * other threads and other callers are not affected.
  */
 #include <windows.h>
 #include <intrin.h>
@@ -52,6 +58,7 @@ typedef int(__cdecl *Render2dStuff_t)(void);
 typedef void(__cdecl *RenderScene_t)(void);
 
 static Render2dStuff_t g_prevRender2d;
+static DWORD g_mainThread;
 static LONG g_fired;
 static FILE *g_log;
 
@@ -148,6 +155,80 @@ static void __fastcall AddTaskPhysResponseHook(void *intelligence, void *edx, vo
     }
 }
 
+/* ---- VirtualQuery cache (main thread only, emptied every frame) ---- */
+typedef SIZE_T(WINAPI *VirtualQuery_t)(LPCVOID, PMEMORY_BASIC_INFORMATION, SIZE_T);
+
+#define VQ_CACHE_SIZE 64
+typedef struct {
+    DWORD start, end; /* pages [start, end) known to have this mbi */
+    DWORD frame;
+    MEMORY_BASIC_INFORMATION mbi;
+} VqEntry;
+
+static VirtualQuery_t g_realVirtualQuery;
+static VqEntry g_vq[VQ_CACHE_SIZE];
+static int g_vqNext;
+static DWORD g_frame = 1; /* advanced once a frame by Render2dStuffHook */
+static DWORD g_vqCalls, g_vqHits, g_vqReported;
+
+static SIZE_T WINAPI CachedVirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T length)
+{
+    DWORD page = (DWORD)(UINT_PTR)address & ~0xFFFu;
+    SIZE_T got;
+    int i;
+
+    if (GetCurrentThreadId() != g_mainThread || length < sizeof(*info))
+        return g_realVirtualQuery(address, info, length);
+    g_vqCalls++;
+    for (i = 0; i < VQ_CACHE_SIZE; i++) {
+        VqEntry *e = &g_vq[i];
+        if (e->frame == g_frame && page >= e->start && page < e->end) {
+            *info = e->mbi; /* same region: only where the answer starts differs */
+            info->BaseAddress = (PVOID)(UINT_PTR)page;
+            info->RegionSize = e->end - page;
+            g_vqHits++;
+            return sizeof(*info);
+        }
+    }
+    got = g_realVirtualQuery(address, info, length);
+    if (got >= sizeof(*info) && info->RegionSize) {
+        VqEntry *e = &g_vq[g_vqNext];
+        g_vqNext = (g_vqNext + 1) % VQ_CACHE_SIZE;
+        e->start = (DWORD)(UINT_PTR)info->BaseAddress;
+        e->end = e->start + (DWORD)info->RegionSize;
+        e->frame = g_frame;
+        e->mbi = *info;
+    }
+    return got;
+}
+
+/* Points Jolt's import of VirtualQuery at the cache. */
+static void PatchJoltVirtualQuery(void)
+{
+    BYTE *jolt = (BYTE *)GetModuleHandleA("JoltPhysics.SA.asi");
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_IMPORT_DESCRIPTOR *d;
+    DWORD real, patched = 0, old;
+
+    if (!jolt) return;
+    real = (DWORD)(UINT_PTR)GetProcAddress(GetModuleHandleA("kernel32.dll"), "VirtualQuery");
+    nt = (IMAGE_NT_HEADERS *)(jolt + ((IMAGE_DOS_HEADER *)jolt)->e_lfanew);
+    if (!real || !nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress) return;
+    g_realVirtualQuery = (VirtualQuery_t)(UINT_PTR)real;
+    for (d = (IMAGE_IMPORT_DESCRIPTOR *)(jolt + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+         d->Name; d++) {
+        DWORD *slot;
+        for (slot = (DWORD *)(jolt + d->FirstThunk); *slot; slot++) {
+            if (*slot != real) continue;
+            VirtualProtect(slot, 4, PAGE_READWRITE, &old);
+            InterlockedExchange((LONG *)slot, (LONG)(UINT_PTR)CachedVirtualQuery);
+            VirtualProtect(slot, 4, old, &old);
+            patched++;
+        }
+    }
+    Log("JoltPhysics.SA.asi: VirtualQuery cache installed (%u import slot(s))", patched, 0);
+}
+
 /* Only for the JoltPhysics.SA.asi build this was traced on; any other build is left alone. */
 static void PatchJoltGetUp(void)
 {
@@ -171,8 +252,16 @@ static int __cdecl Render2dStuffHook(void)
 {
     static LONG rhPatched, joltPatched;
     DWORD ret = (DWORD)(UINT_PTR)_ReturnAddress();
-    if (!InterlockedExchange(&joltPatched, 1))
+    if (!InterlockedExchange(&joltPatched, 1)) {
+        g_mainThread = GetCurrentThreadId();
         PatchJoltGetUp(); /* every mod is loaded and hooked by now */
+        PatchJoltVirtualQuery();
+    }
+    g_frame++; /* new frame: cached VirtualQuery answers expire */
+    if (g_frame - g_vqReported >= 3600 && g_vqCalls) { /* about once a minute */
+        g_vqReported = g_frame;
+        Log("VirtualQuery cache: %u of %u main-thread calls answered from the cache", g_vqHits, g_vqCalls);
+    }
     /* From the original Idle the events already fired; only bridge RenderHook's Idle. */
     if (ret < EXE_CODE_BEGIN || ret >= EXE_CODE_END) {
         if (!InterlockedExchange(&rhPatched, 1))

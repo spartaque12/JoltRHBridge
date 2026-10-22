@@ -52,6 +52,26 @@ aborts and removes a waiting fall-and-get-up task from the event-response slots,
 get-up plays. It only patches the Jolt build it was traced on (the September 22 build) and logs
 it if your build differs.
 
+## VirtualQuery cache (stutter fix)
+
+Before Jolt reads a game pointer, it checks the memory is readable by calling `VirtualQuery`, a
+system call, once per pointer. In busy scenes that's hundreds of thousands of calls per minute on
+the game's main thread, and single frames lost 5–37 ms to it (measured with a frame profiler built
+into gtaRenderHook).
+
+The bridge points Jolt's `VirtualQuery` import at a small cache. On the main thread, an answer is
+reused for any address in the same memory region until the frame ends. Jolt's worker threads, and
+everything outside Jolt, still call Windows directly. In a test against the real `VirtualQuery`
+(3.1 million addresses, cached and uncached) every answer matched. In game, about 90% of Jolt's
+main-thread calls are answered from the cache, and the time Jolt spends in slow frames dropped
+from 5–37 ms to under 1 ms.
+
+About once a minute, `JoltRHBridge.log` reports the hit rate:
+
+```
+VirtualQuery cache: 650244 of 725203 main-thread calls answered from the cache
+```
+
 ## Install
 
 1. Install Jolt Physics. Put `JoltPhysics.SA.asi`, `.ini` and `.dat` in the **game
@@ -62,6 +82,7 @@ it if your build differs.
    ```
    hooked Render2dStuff call at 0x0053EB12 (previous target 0x0053E230)
    JoltPhysics.SA.asi at 0x...: double get-up fix installed
+   JoltPhysics.SA.asi: VirtualQuery cache installed (1 import slot(s))
    repointed 2 RenderHook CGame::Process pointer(s) to the 0x53E981 chain head 0x...
    first renderSceneEvent fired via chain head 0x...
    ```
